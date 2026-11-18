@@ -59,6 +59,16 @@ func selbsttest() throws {
     let v2 = Verlauf(ordner: daten)
     try pruefe(v2.eintraege == v.eintraege, "Sichern und Laden")
 
+    // Schutz der Ablage
+    func rechte(_ u: URL) -> Int { (try? fm.attributesOfItem(atPath: u.path))?[.posixPermissions] as? Int ?? -1 }
+    try pruefe(rechte(daten) == 0o700 && rechte(v.bilderOrdner) == 0o700, "Ablage nur für dich lesbar")
+    try pruefe(rechte(v.datei) == 0o600 && rechte(v.bildURL(b!)!) == 0o600, "Verlauf und Bilder nur für dich lesbar")
+    try pruefe((try? daten.resourceValues(forKeys: [.isExcludedFromBackupKey]))?.isExcludedFromBackup == true, "Ablage nicht im Backup")
+    var fremd = v.eintrag(b!.id)!; fremd.bild = "../../verlauf.json"
+    try pruefe(v.bildURL(fremd) == nil, "Bildname außerhalb von bilder/ wird nicht benutzt")
+    try pruefe(v.aufnehmen(.bild(png, 20_000, 20_000), app: nil, bundle: nil) == nil, "Riesige Bildmaße werden abgelehnt")
+    try pruefe(Verlauf.yamlText("A: \"b\"\nc") == "\"A: \\\"b\\\" c\"", "App-Name im YAML-Kopf maskiert")
+
     // Inbox
     let inbox = ordner.appendingPathComponent("inbox")
     try fm.createDirectory(at: inbox, withIntermediateDirectories: true)

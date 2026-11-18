@@ -13,8 +13,9 @@ VERSION="$(tr -d ' \n' < "$APP_DIR/VERSION")"
 BUNDLE="$APP_DIR/build/Hikidashi.app"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
-export CLANG_MODULE_CACHE_PATH="${TMPDIR:-/tmp}/hikidashi-clang-cache"
-export SWIFT_MODULECACHE_PATH="${TMPDIR:-/tmp}/hikidashi-swift-cache"
+# Modul-Cache im eigenen build/, nicht im geteilten /tmp, wo ein anderer Benutzer ihn vorbelegen könnte.
+export CLANG_MODULE_CACHE_PATH="$APP_DIR/build/module-cache/clang"
+export SWIFT_MODULECACHE_PATH="$APP_DIR/build/module-cache/swift"
 
 xcrun swiftc -O -swift-version 5 -module-cache-path "$SWIFT_MODULECACHE_PATH" \
   -target arm64-apple-macos14.0 -framework Cocoa -framework Carbon -framework ServiceManagement -framework Vision -framework ApplicationServices \
@@ -61,8 +62,9 @@ PLIST
 
 # Mit einem Apple-Entwickler-Zertifikat signieren, falls vorhanden: dann hält die Freigabe
 # unter Bedienungshilfen auch nach einem Neubau. Sonst ad hoc ("-"), das reicht zum Benutzen.
+# Hardened Runtime: Ohne sie könnte fremder Code per DYLD_INSERT_LIBRARIES die Freigabe unter Bedienungshilfen mitbenutzen.
 IDENTITAET="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/ {print $2; exit}')"
-codesign --force --sign "${IDENTITAET:--}" "$BUNDLE" >/dev/null
+codesign --force --options runtime --sign "${IDENTITAET:--}" "$BUNDLE" >/dev/null
 "$BUNDLE/Contents/MacOS/Hikidashi" --self-test
 
 [ "${1:-}" = "--nur-bau" ] && { echo "Fertig: $BUNDLE"; exit 0; }

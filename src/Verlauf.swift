@@ -43,6 +43,8 @@ final class Verlauf {
     static let maxBilder = 60
     static let maxTextBytes = 2_000_000
     static let maxBildBytes = 40_000_000
+    /// Breite × Höhe: Ein kleines PNG kann riesige Maße haben und beim Entpacken den Speicher sprengen.
+    static let maxBildPixel = 100_000_000
 
     /// Typen, die Passwort-Manager und andere Apps setzen, wenn etwas nicht in einen Verlauf gehört.
     static let ignorierteTypen: Set<String> = [
@@ -53,6 +55,8 @@ final class Verlauf {
     static let ignorierteApps: Set<String> = [
         "com.apple.keychainaccess", "com.apple.Passwords", "com.1password.1password", "com.agilebits.onepassword7",
         "com.bitwarden.desktop", "com.dashlane.dashlanephonefinal", "com.lastpass.LastPass", "org.keepassxc.keepassxc",
+        "me.proton.pass.electron", "com.markmcguill.strongbox.mac", "in.sinew.Enpass-Desktop", "com.hicknhacksoftware.MacPass",
+        "net.antelle.keeweb",
     ]
 
     let ordner: URL
@@ -63,8 +67,26 @@ final class Verlauf {
 
     init(ordner: URL) {
         self.ordner = ordner
-        try? FileManager.default.createDirectory(at: bilderOrdner, withIntermediateDirectories: true)
+        let fm = FileManager.default
+        try? fm.createDirectory(at: bilderOrdner, withIntermediateDirectories: true)
+        // Nur für dich lesbar und nicht im Time-Machine-Backup: Leeren soll den Verlauf wirklich loswerden.
+        for o in [ordner, bilderOrdner] { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: o.path) }
+        let bilder = (try? fm.contentsOfDirectory(at: bilderOrdner, includingPropertiesForKeys: nil)) ?? []
+        for d in bilder + [datei] { try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: d.path) }
+        var ohneBackup = URLResourceValues(); ohneBackup.isExcludedFromBackup = true
+        var o = ordner; try? o.setResourceValues(ohneBackup)
         laden()
+    }
+
+    /// Schreibt so, dass nur du die Datei lesen kannst.
+    static func schreibePrivat(_ daten: Data, nach url: URL) throws {
+        try daten.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    /// Nur `<UUID>.png` gilt als Bildname. Ein veränderter `verlauf.json` soll keine Dateien außerhalb von `bilder/` erreichen.
+    static func gueltigerBildname(_ name: String) -> Bool {
+        name.hasSuffix(".png") && UUID(uuidString: String(name.dropLast(4))) != nil
     }
 
     static var standardOrdner: URL {
@@ -81,7 +103,7 @@ final class Verlauf {
 
     func sichern() {
         let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601
-        if let daten = try? e.encode(eintraege) { try? daten.write(to: datei, options: .atomic) }
+        if let daten = try? e.encode(eintraege) { try? Verlauf.schreibePrivat(daten, nach: datei) }
         geaendert?()
     }
 
@@ -96,11 +118,11 @@ final class Verlauf {
             guard t.utf8.count <= Verlauf.maxTextBytes else { return nil }
             neu = Eintrag(id: UUID().uuidString, art: .text, text: t, zeit: jetzt, hash: "t:" + Verlauf.hash(Data(t.utf8)))
         case .bild(let png, let b, let h):
-            guard png.count <= Verlauf.maxBildBytes else { return nil }
+            guard png.count <= Verlauf.maxBildBytes, b * h <= Verlauf.maxBildPixel else { return nil }
             neu = Eintrag(id: UUID().uuidString, art: .bild, breite: b, hoehe: h, zeit: jetzt, hash: "b:" + Verlauf.hash(png))
             if let i = eintraege.firstIndex(where: { $0.hash == neu.hash }) { return nachOben(i, app: app, bundle: bundle, jetzt: jetzt) }
             let name = neu.id + ".png"
-            do { try png.write(to: bilderOrdner.appendingPathComponent(name), options: .atomic) } catch { return nil }
+            do { try Verlauf.schreibePrivat(png, nach: bilderOrdner.appendingPathComponent(name)) } catch { return nil }
             neu.bild = name
         case .dateien(let urls):
             let pfade = urls.map(\.path)
@@ -158,7 +180,7 @@ final class Verlauf {
     }
 
     private func entferneBild(_ e: Eintrag) {
-        if let b = e.bild { try? FileManager.default.removeItem(at: bilderOrdner.appendingPathComponent(b)) }
+        if let url = bildURL(e) { try? FileManager.default.removeItem(at: url) }
     }
 
     /// Hält den Verlauf klein: höchstens 300 Einträge und 60 Bilder, Angeheftetes zählt nicht mit.
@@ -177,7 +199,9 @@ final class Verlauf {
 
     // MARK: Lesen
 
-    func bildURL(_ e: Eintrag) -> URL? { e.bild.map { bilderOrdner.appendingPathComponent($0) } }
+    func bildURL(_ e: Eintrag) -> URL? {
+        e.bild.flatMap { Verlauf.gueltigerBildname($0) ? bilderOrdner.appendingPathComponent($0) : nil }
+    }
 
     func eintrag(_ id: String) -> Eintrag? { eintraege.first { $0.id == id } }
 
@@ -228,9 +252,11 @@ final class Verlauf {
 
     static func pngAus(_ pb: NSPasteboard) -> Inhalt? {
         if let png = pb.data(forType: .png), let rep = NSBitmapImageRep(data: png) {
+            guard rep.pixelsWide * rep.pixelsHigh <= maxBildPixel else { return nil }
             return .bild(png, rep.pixelsWide, rep.pixelsHigh)
         }
         guard let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff),
+              rep.pixelsWide * rep.pixelsHigh <= maxBildPixel,
               let png = rep.representation(using: .png, properties: [:]) else { return nil }
         return .bild(png, rep.pixelsWide, rep.pixelsHigh)
     }
@@ -256,6 +282,9 @@ final class Verlauf {
     /// Erkennt Text auf einem Bild, lokal mit Apples Vision. Deutsch, Englisch, Chinesisch und Japanisch.
     static func erkenneText(_ url: URL) throws -> String {
         guard let quelle = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let werte = CGImageSourceCopyPropertiesAtIndex(quelle, 0, nil) as? [CFString: Any],
+              let b = werte[kCGImagePropertyPixelWidth] as? Int, let h = werte[kCGImagePropertyPixelHeight] as? Int,
+              b * h <= maxBildPixel,
               let bild = CGImageSourceCreateImageAtIndex(quelle, 0, nil) else { throw VerlaufFehler.meldung("Bild nicht lesbar") }
         let anfrage = VNRecognizeTextRequest()
         anfrage.recognitionLevel = .accurate
@@ -285,7 +314,8 @@ final class Verlauf {
             let text = e.text ?? ""
             let ziel = frei("\(stempel)-\(kurzname(text))", "md")
             let f2 = DateFormatter(); f2.locale = Locale(identifier: "de_DE"); f2.dateFormat = "yyyy-MM-dd"
-            let kopf = "---\ntags: [inbox]\nerstellt: \(f2.string(from: jetzt))\nquelle: Hikidashi\(e.app.map { " (kopiert aus \($0))" } ?? "")\n---\n\n"
+            let quelle = "Hikidashi" + (e.app.map { " (kopiert aus \($0))" } ?? "")
+            let kopf = "---\ntags: [inbox]\nerstellt: \(f2.string(from: jetzt))\nquelle: \(yamlText(quelle))\n---\n\n"
             try (kopf + text + (text.hasSuffix("\n") ? "" : "\n")).write(to: ziel, atomically: true, encoding: .utf8)
             return [ziel]
         case .bild:
@@ -308,6 +338,13 @@ final class Verlauf {
             if ziele.isEmpty { throw VerlaufFehler.meldung("Nichts zum Ablegen: Ordner, sehr große oder gelöschte Dateien gehen nicht in die Inbox.") }
             return ziele
         }
+    }
+
+    /// Text in Anführungszeichen für den YAML-Kopf, damit ein App-Name mit `:` oder Zeilenumbruch ihn nicht zerlegt.
+    static func yamlText(_ s: String) -> String {
+        let innen = s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
+        return "\"\(innen)\""
     }
 
     /// Die ersten Wörter als Dateiname: „Idee für das nächste Video“ → „idee-fuer-das-naechste-video“

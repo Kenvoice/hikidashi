@@ -192,6 +192,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFiel
     var bildCache: [String: NSImage] = [:]
     var erkennungLaeuft = Set<String>()
     var wartendeKopie: String?
+    /// Alle Apps, die seit der letzten Prüfung vorne waren. Kopiert wurde in einer davon, nicht unbedingt in der jetzt vorderen.
+    var vorneSeitPruefung = Set<String>()
     let erkennung = DispatchQueue(label: "hikidashi.erkennung", qos: .utility)
 
     var direktEinfuegen: Bool { get { speicher.object(forKey: "direkt") as? Bool ?? true } set { speicher.set(newValue, forKey: "direkt") } }
@@ -214,6 +216,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFiel
         baueMenueleiste()
         if App.probe { probelauf(); return }
         if !registriereTaste() { meldung("Die Tastenkombination ⌃⌥V ist schon belegt. Hikidashi öffnest du über das Symbol in der Menüleiste.") }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
+            if let b = (n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier { self?.vorneSeitPruefung.insert(b) }
+        }
         let uhr = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.pruefeZwischenablage() }
         RunLoop.main.add(uhr, forMode: .common)
         pruefeZwischenablage() // nimmt auf, was beim Start schon drin liegt
@@ -223,12 +228,16 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFiel
     // MARK: Zwischenablage beobachten
 
     func pruefeZwischenablage() {
+        let vorne = NSWorkspace.shared.frontmostApplication
+        let jetztVorne = Set([vorne?.bundleIdentifier].compactMap { $0 })
+        let warenVorne = vorneSeitPruefung.union(jetztVorne)
+        vorneSeitPruefung = jetztVorne
         let pb = NSPasteboard.general
         guard pb.changeCount != letzterStand else { return }
         letzterStand = pb.changeCount
         guard !pausiert else { return }
-        let vorne = NSWorkspace.shared.frontmostApplication
-        if let b = vorne?.bundleIdentifier, Verlauf.ignorierteApps.contains(b) { return }
+        // Wer aus dem Passwort-Manager kopiert und sofort die App wechselt, ist hier schon woanders.
+        guard warenVorne.isDisjoint(with: Verlauf.ignorierteApps) else { return }
         guard let inhalt = Verlauf.lies(pb),
               let neu = verlauf.aufnehmen(inhalt, app: vorne?.localizedName, bundle: vorne?.bundleIdentifier) else { return }
         if neu.art == .bild, neu.erkannt != true { erkenne(neu.id) }
@@ -285,6 +294,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFiel
         panel.isMovableByWindowBackground = true
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .transient]
+        panel.sharingType = .none // nicht in Bildschirmfreigabe und Aufnahmen zeigen, soweit macOS das beachtet
         panel.minSize = NSSize(width: 760, height: 380)
         panel.delegate = self
         panel.beiEsc = { [weak self] in self?.esc() }
@@ -708,13 +718,22 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFiel
         verlauf.schreibe(e, auf: pb)
         letzterStand = pb.changeCount
         verlauf.benutzt(e.id)
+        let ziel = vorher
         verstecke()
-        guard einfuegen, direktEinfuegen, !App.probe else { return }
+        guard einfuegen, direktEinfuegen, !App.probe, let ziel else { return }
         guard AXIsProcessTrusted() else {
             if !speicher.bool(forKey: "freigabeGefragt") { speicher.set(true, forKey: "freigabeGefragt"); frageFreigabe() }
             return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { App.drueckeEinfuegen() }
+        App.fuegeEin(in: ziel)
+    }
+
+    /// Drückt ⌘V erst, wenn die App von vorher wirklich vorne ist. Sonst landet der Eintrag nirgends, nur in der Zwischenablage.
+    static func fuegeEin(in ziel: NSRunningApplication, versuche: Int = 6) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == ziel.processIdentifier { drueckeEinfuegen() }
+            else if versuche > 1, !ziel.isTerminated { fuegeEin(in: ziel, versuche: versuche - 1) }
+        }
     }
 
     /// Schickt ⌘V an das Fenster vorne. Braucht die Freigabe unter Bedienungshilfen.
